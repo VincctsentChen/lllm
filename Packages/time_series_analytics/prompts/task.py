@@ -80,8 +80,11 @@ profile = Prompt(
         "Value column: {value_col}\n"
         "Expected frequency: {frequency}\n"
         "Forecast horizon: {horizon}\n\n"
+        "Preprocessing already applied (frequency inference / gap handling):\n"
+        "{preprocessing}\n\n"
         "Data sample:\n{series_data}\n\n"
-        "Return structured bullet points for data quality and pattern clues."
+        "Return structured bullet points for data quality and pattern clues. Take the\n"
+        "preprocessing notes into account (do not re-report issues already fixed)."
     ),
     metadata={"stage": "profile"},
 )
@@ -115,6 +118,7 @@ synthesize = Prompt(
         "Frequency: {frequency}\n\n"
         "Profiler report:\n{profile_report}\n\n"
         "Forecast interpretation:\n{forecast_report}\n\n"
+        "Preprocessing applied (frequency inference / gap handling):\n{preprocessing}\n\n"
         "Forecasting method: {forecast_method}\n"
         "Model diagnostics:\n{diagnostics}\n\n"
         "Authoritative forecast points (use these EXACTLY in the 'forecast' field):\n"
@@ -126,6 +130,8 @@ synthesize = Prompt(
         "Do not alter the forecast numbers or anomaly windows. Write the narrative\n"
         "fields (summary, key_patterns, data_quality_issues, recommendations,\n"
         "confidence_note) grounded in the profiler findings and the interpretation.\n"
+        "Preprocessing actions above are recorded automatically in data_quality_issues,\n"
+        "so do not repeat them; add only additional data-quality observations.\n"
         "Calibrate the confidence_note using the backtest accuracy and interval coverage."
     ),
     format=TimeSeriesAnalysisResult,

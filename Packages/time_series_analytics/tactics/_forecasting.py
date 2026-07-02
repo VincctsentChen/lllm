@@ -41,6 +41,44 @@ _SEASONAL_PERIODS = {
     "Y": 1, "A": 1, "YS": 1,
 }
 
+# Map a user-supplied frequency alias to a pandas offset alias for date_range.
+# (pandas 2.2+ renamed some aliases: M->ME, H->h, T->min, etc.)
+_PANDAS_FREQ = {
+    "D": "D", "B": "B", "W": "W",
+    "M": "ME", "MS": "MS",
+    "Q": "QE", "QS": "QS",
+    "H": "h", "T": "min", "MIN": "min", "S": "s",
+    "Y": "YE", "A": "YE", "YS": "YS",
+}
+
+
+def _to_pandas_freq(frequency: str) -> Optional[str]:
+    """Translate a user frequency alias into a pandas offset alias, or None."""
+    if not frequency:
+        return None
+    key = str(frequency).upper()
+    if key in _PANDAS_FREQ:
+        return _PANDAS_FREQ[key]
+    # try the leading letters (e.g. "MIN")
+    letters = "".join(ch for ch in key if ch.isalpha())
+    return _PANDAS_FREQ.get(letters, _PANDAS_FREQ.get(letters[:1], None) if letters else None)
+
+
+@dataclass
+class PreparedSeries:
+    """Cleaned/regularized series plus the data-quality record of what changed."""
+
+    timestamps: List[str]
+    values: np.ndarray
+    inferred_frequency: Optional[str] = None
+    effective_frequency: Optional[str] = None
+    fill_method: str = "none"
+    n_duplicates: int = 0
+    n_gaps: int = 0
+    n_filled: int = 0
+    is_datetime: bool = False
+    issues: List[Dict] = field(default_factory=list)  # issue/severity/evidence
+
 
 @dataclass
 class StatisticalForecast:
@@ -52,6 +90,9 @@ class StatisticalForecast:
     method: str = ""
     confidence_level: float = 0.90
     backtest_metrics: Optional[Dict] = None               # mae/rmse/smape/mape/coverage/...
+    data_quality_issues: List[Dict] = field(default_factory=list)  # from preprocessing
+    inferred_frequency: Optional[str] = None
+    effective_frequency: Optional[str] = None
 
     # -- prompt-friendly renderings -----------------------------------------
     def forecast_table_text(self) -> str:
@@ -100,6 +141,20 @@ class StatisticalForecast:
         parts.append(f"- {pct}% interval coverage: {bt.get('coverage')} (target {self.confidence_level})")
         parts.append(f"- mean interval width: {bt.get('mean_interval_width')}")
         return "\n".join(parts)
+
+    def preprocessing_text(self) -> str:
+        freq = self.effective_frequency or "unknown"
+        inf = self.inferred_frequency or "none detected"
+        lines = [
+            f"inferred frequency: {inf}; effective frequency used: {freq}",
+        ]
+        if self.data_quality_issues:
+            lines.append("data-quality actions taken during preprocessing:")
+            for d in self.data_quality_issues:
+                lines.append(f"- [{d.get('severity')}] {d.get('issue')}: {d.get('evidence')}")
+        else:
+            lines.append("no timestamp/gap issues detected during preprocessing.")
+        return "\n".join(lines)
 
 
 def _z_for(confidence_level: float) -> float:
@@ -155,6 +210,149 @@ def _parse_series(
         timestamps = [str(i) for i in range(len(values))]
 
     return timestamps, values
+
+
+def _gap_severity(fraction: float) -> str:
+    if fraction > 0.20:
+        return "high"
+    if fraction > 0.05:
+        return "medium"
+    return "low"
+
+
+def _prepare_series(
+    timestamps: List[str], values: np.ndarray, frequency: str, fill_method: str
+) -> PreparedSeries:
+    """Sort, deduplicate, infer frequency, and (optionally) regularize/fill gaps.
+
+    Every change is recorded as a data-quality issue so nothing is silently
+    distorted. Non-datetime timestamps skip frequency/gap handling gracefully.
+    """
+    fill_method = (fill_method or "none").lower()
+    values = np.asarray(values, dtype=float)
+    issues: List[Dict] = []
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        parsed = pd.to_datetime(pd.Series(timestamps), errors="coerce")
+    n_unparsed = int(parsed.isna().sum())
+    if n_unparsed >= len(parsed):
+        # No datetime information — cannot infer frequency or detect gaps.
+        return PreparedSeries(
+            timestamps=list(timestamps), values=values,
+            inferred_frequency=None, effective_frequency=frequency,
+            fill_method=fill_method, is_datetime=False,
+            issues=[{
+                "issue": "non-datetime timestamps",
+                "severity": "low",
+                "evidence": "Timestamps are not date-like; frequency inference and gap handling were skipped.",
+            }],
+        )
+
+    if n_unparsed > 0:
+        keep = parsed.notna().to_numpy()
+        issues.append({
+            "issue": "unparseable timestamps dropped",
+            "severity": "medium",
+            "evidence": f"{n_unparsed} row(s) had timestamps that could not be parsed as dates and were dropped.",
+        })
+        parsed = parsed[keep]
+        values = values[keep]
+
+    s = pd.Series(values, index=pd.DatetimeIndex(parsed.values))
+
+    if not s.index.is_monotonic_increasing:
+        s = s.sort_index()
+        issues.append({
+            "issue": "timestamps out of order",
+            "severity": "low",
+            "evidence": "Rows were not sorted by time; the series was sorted ascending before modeling.",
+        })
+
+    n_duplicates = int(s.index.duplicated().sum())
+    if n_duplicates > 0:
+        s = s.groupby(level=0).mean()
+        issues.append({
+            "issue": "duplicate timestamps aggregated",
+            "severity": "medium",
+            "evidence": f"{n_duplicates} duplicate timestamp(s) were averaged into single observations.",
+        })
+
+    try:
+        inferred = pd.infer_freq(s.index) if len(s.index) >= 3 else None
+    except (ValueError, TypeError):
+        inferred = None
+
+    target = inferred or _to_pandas_freq(frequency)
+    n_gaps = 0
+    n_filled = 0
+    effective = inferred or frequency
+
+    if target:
+        try:
+            full = pd.date_range(s.index.min(), s.index.max(), freq=target)
+        except (ValueError, TypeError):
+            full = None
+        if full is not None and len(full) > len(s):
+            n_gaps = len(full) - len(s)
+            fraction = n_gaps / max(len(full), 1)
+            if fill_method == "none":
+                issues.append({
+                    "issue": "missing timestamps",
+                    "severity": _gap_severity(fraction),
+                    "evidence": f"{n_gaps} missing {target} period(s) detected; not filled (fill_method=none).",
+                })
+            else:
+                reindexed = s.reindex(full)
+                if fill_method == "drop":
+                    s = reindexed.dropna()
+                    issues.append({
+                        "issue": "missing timestamps",
+                        "severity": _gap_severity(fraction),
+                        "evidence": f"{n_gaps} missing {target} period(s) detected; gap rows left out (fill_method=drop).",
+                    })
+                else:
+                    if fill_method == "ffill":
+                        s = reindexed.ffill().bfill()
+                    elif fill_method == "median":
+                        s = reindexed.fillna(float(np.nanmedian(reindexed.to_numpy())))
+                    else:  # linear_interpolate (default)
+                        fill_method = "linear_interpolate"
+                        s = reindexed.interpolate(method="linear", limit_direction="both")
+                    n_filled = n_gaps
+                    issues.append({
+                        "issue": "missing timestamps filled",
+                        "severity": _gap_severity(fraction),
+                        "evidence": f"{n_gaps} missing {target} period(s) filled via {fill_method}.",
+                    })
+            effective = target
+        elif full is not None:
+            effective = target
+    else:
+        issues.append({
+            "issue": "frequency not determined",
+            "severity": "low",
+            "evidence": "Could not infer or map a frequency; the series was used with its original spacing.",
+        })
+
+    # Render timestamps back to strings (date-only when there is no time-of-day).
+    if len(s.index) and (s.index == s.index.normalize()).all():
+        out_ts = list(s.index.strftime("%Y-%m-%d"))
+    else:
+        out_ts = list(s.index.strftime("%Y-%m-%d %H:%M:%S"))
+
+    return PreparedSeries(
+        timestamps=out_ts,
+        values=s.to_numpy(dtype=float),
+        inferred_frequency=inferred,
+        effective_frequency=effective,
+        fill_method=fill_method,
+        n_duplicates=n_duplicates,
+        n_gaps=n_gaps,
+        n_filled=n_filled,
+        is_datetime=True,
+        issues=issues,
+    )
 
 
 def _fit_and_forecast(
@@ -407,17 +605,29 @@ def run_statistical_forecast(
     confidence_level: float = 0.90,
     backtest: bool = True,
     backtest_max_splits: int = 5,
+    fill_method: str = "linear_interpolate",
 ) -> StatisticalForecast:
     """Fit a statistical model and return numeric forecast + anomalies + backtest.
 
+    The raw series is first sorted, de-duplicated, frequency-inferred, and
+    (optionally) regularized/gap-filled via ``fill_method`` (one of ``none``,
+    ``ffill``, ``linear_interpolate``, ``median``, ``drop``). Every cleaning
+    action is recorded in ``data_quality_issues``.
+
     Raises ValueError only if the series cannot be parsed at all.
     """
-    timestamps, values = _parse_series(series_data, timestamp_col, value_col)
-    n = len(values)
-    if n == 0:
+    raw_timestamps, raw_values = _parse_series(series_data, timestamp_col, value_col)
+    if len(raw_values) == 0:
         raise ValueError("No numeric observations found in the provided series data.")
 
-    m = _seasonal_periods(frequency)
+    prepared = _prepare_series(raw_timestamps, raw_values, frequency, fill_method)
+    timestamps, values = prepared.timestamps, prepared.values
+    n = len(values)
+    if n == 0:
+        raise ValueError("No usable observations remain after preprocessing the series.")
+
+    seasonal_freq = prepared.effective_frequency if prepared.is_datetime else frequency
+    m = _seasonal_periods(seasonal_freq)
     use_seasonal = m >= 2 and n >= 2 * m + 1
 
     point, resid, method, diagnostics = _fit_and_forecast(values, horizon, m, use_seasonal)
@@ -459,6 +669,12 @@ def run_statistical_forecast(
         "non_negative_clamped": non_negative,
         "n_anomalies": len(anomalies),
         "backtest_splits": backtest_metrics.get("n_splits") if backtest_metrics else 0,
+        "inferred_frequency": prepared.inferred_frequency,
+        "effective_frequency": prepared.effective_frequency,
+        "fill_method": prepared.fill_method,
+        "n_duplicates": prepared.n_duplicates,
+        "n_gaps": prepared.n_gaps,
+        "n_filled": prepared.n_filled,
     })
 
     return StatisticalForecast(
@@ -468,4 +684,7 @@ def run_statistical_forecast(
         method=method,
         confidence_level=confidence_level,
         backtest_metrics=backtest_metrics,
+        data_quality_issues=prepared.issues,
+        inferred_frequency=prepared.inferred_frequency,
+        effective_frequency=prepared.effective_frequency,
     )

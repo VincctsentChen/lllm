@@ -49,6 +49,10 @@ class TimeSeriesTask(BaseModel):
         default=0.90, gt=0.0, lt=1.0,
         description="Two-sided confidence level for the prediction intervals.",
     )
+    fill_method: str = Field(
+        default="linear_interpolate",
+        description="Gap-fill strategy: none, ffill, linear_interpolate, median, or drop.",
+    )
 
 
 class TimeSeriesAnalysisTactic(Tactic):
@@ -81,11 +85,13 @@ class TimeSeriesAnalysisTactic(Tactic):
             horizon=task.horizon,
             frequency=task.frequency,
             confidence_level=task.confidence_level,
+            fill_method=task.fill_method,
         )
         forecast_text = stat.forecast_table_text()
         anomalies_text = stat.anomalies_text()
         diagnostics_text = stat.diagnostics_text()
         backtest_text = stat.backtest_text()
+        preprocessing_text = stat.preprocessing_text()
 
         # --- 2) Profile the raw data --------------------------------------------
         profiler.open("profile")
@@ -98,6 +104,7 @@ class TimeSeriesAnalysisTactic(Tactic):
                 "horizon": task.horizon,
                 "frequency": task.frequency,
                 "objective": task.objective,
+                "preprocessing": preprocessing_text,
             },
         )
         profile_report = profiler.respond().content
@@ -135,6 +142,7 @@ class TimeSeriesAnalysisTactic(Tactic):
                 "statistical_forecast": forecast_text,
                 "detected_anomalies": anomalies_text,
                 "backtest": backtest_text,
+                "preprocessing": preprocessing_text,
             },
         )
         response = synthesizer.respond()
@@ -174,4 +182,16 @@ class TimeSeriesAnalysisTactic(Tactic):
                 result.backtest_metrics = bt_model(
                     **{k: v for k, v in stat.backtest_metrics.items() if k in allowed}
                 )
+
+        # Preprocessing (frequency inference / gap handling) records are facts
+        # computed in code; prepend them to the LLM's data-quality observations.
+        if stat.data_quality_issues:
+            dq_field = output_model.model_fields["data_quality_issues"]
+            dq_model = dq_field.annotation.__args__[0]
+            allowed = set(dq_model.model_fields)
+            code_issues = [
+                dq_model(**{k: v for k, v in d.items() if k in allowed})
+                for d in stat.data_quality_issues
+            ]
+            result.data_quality_issues = code_issues + list(result.data_quality_issues)
         return result
